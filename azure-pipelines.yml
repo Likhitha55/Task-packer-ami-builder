@@ -100,7 +100,7 @@ stages:
               echo "=== Packer Build ==="
               packer build . 2>&1 | tee packer-output.log
 
-              AMI_ID=$(jq -r '.builds[-1].artifact_id | split(":")' packer-manifest.json)
+              AMI_ID=$(grep -oP 'ami-[a-z0-9]+' packer-output.log | tail -1)
               echo "Built AMI ID: $AMI_ID"
 
               if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "null" ]; then
