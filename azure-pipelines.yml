@@ -95,10 +95,10 @@ stages:
 
               echo "=== Packer Init ==="
               cd packer/
-              packer init.
+              packer init .
 
               echo "=== Packer Build ==="
-              packer build -machine-readable. | tee packer-output.log
+              packer build . 2>&1 | tee packer-output.log
 
               AMI_ID=$(jq -r '.builds[-1].artifact_id | split(":")' packer-manifest.json)
               echo "Built AMI ID: $AMI_ID"
