@@ -1,7 +1,8 @@
-# I am running the pipeline when code is pushed to master branch
-# Stages: 3 (Packer Build -> Terraform Deploy -> Ansible Config)
 
-# to trigger the pipeline when I push code to master branch
+
+# Pipeline 1: Build Custom AMI + Sign Artifact with GPG
+
+# ---- CI Trigger: Run when code is pushed to master ----
 trigger:
   branches:
     include:
@@ -9,383 +10,278 @@ trigger:
   paths:
     include:
       - packer/*
-      - terraform/*
+      - ansible/*
+    exclude:
+      - README.md
+      - docs/*
+
+# ---- PR Trigger: Validate on pull requests ----
+pr:
+  branches:
+    include:
+      - master
+  paths:
+    include:
+      - packer/*
       - ansible/*
 
-# I created variable group and created Access key, Secret Access key, region, and 
-# SSH private key content and my ip in azure pipelines -> library
-
+# ---- Variable Group (AWS credentials) ----
 variables:
-  - group: aws-devops-secrets          # The variable group I created
-  - name: awsRegion
-    value: 'us-east-1'
+  - group: aws-devops-secrets
   - name: amiName
     value: 'devops-custom-ami'
 
-# Building with packer
+# ---- Self-hosted agent pool ----
+pool:
+  name: 'aws-ec2-pool'
+
 stages:
-  - stage: PackerBuild
-    displayName: 'Stage 1 - Build Custom AMI'
+  
+  # Stage 1: Validate (runs on BOTH CI push and PR)
+  - stage: Validate
+    displayName: 'Stage 1 - Validate Packer & Ansible'
+    jobs:
+      - job: ValidateConfig
+        displayName: 'Validate Packer + Ansible Syntax'
+        steps:
+          - checkout: self
+            displayName: 'Checkout Code'
+
+          - script: |
+              echo "=== Packer Version ==="
+              packer --version
+
+              echo "=== Packer Init ==="
+              cd packer/
+              packer init .
+
+              echo "=== Packer Validate ==="
+              packer validate .
+              echo "Packer validation passed!"
+            displayName: 'Validate Packer Config'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
+
+          - script: |
+              echo "=== Ansible Version ==="
+              ansible --version
+
+              echo "=== Ansible Syntax Check ==="
+              cd ansible/
+              ansible-playbook playbooks/install-softwares.yml --syntax-check
+              echo "Ansible syntax check passed!"
+            displayName: 'Validate Ansible Playbooks'
+
+  
+  # Stage 2: Build AMI + Sign (ONLY on CI push, NOT on PR)
+  - stage: BuildAndSign
+    displayName: 'Stage 2 - Build AMI + Sign Artifact'
+    dependsOn: Validate
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
       - job: BuildAMI
-        displayName: 'Packer Build'
-        # pool:
-        #   vmImage: 'ubuntu-latest'
-        pool:
-          name: 'aws-ec2-pool'      
+        displayName: 'Packer Build → Sign → Encrypt'
+        timeoutInMinutes: 30
         steps:
-
-          # Getting code from GitHub
           - checkout: self
-            displayName: 'Checkout Code from GitHub'
+            displayName: 'Checkout Code'
 
-          # Installing Packer on the pipeline server
+          # ---- Build AMI with Packer ----
           - script: |
-              curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
-              echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-              sudo apt-get update && sudo apt-get install -y packer
-              packer version
-            displayName: 'Install Packer'
+              export AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID)
+              export AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY)
+              export AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION)
 
-          # Installing Ansible 
-          - script: |
-              sudo apt-get install -y ansible
-              ansible --version
-            displayName: 'Install Ansible'
-
-          
-          - script: |
-              cd packer
+              echo "=== Packer Init ==="
+              cd packer/
               packer init .
-            displayName: 'Packer Init'
 
-          
-          - script: |
-              cd packer
-              packer validate .
-            displayName: 'Packer Validate'
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-
-          # Building AMI
-          - script: |
-              cd packer
+              echo "=== Packer Build ==="
               packer build -machine-readable . | tee packer-output.log
 
-            
-              AMI_ID=$(grep 'artifact,0,id' packer-output.log | tail -1 | cut -d: -f2)
+              # Extract AMI ID from manifest
+              AMI_ID=$(jq -r '.builds[-1].artifact_id | split(":")[1]' packer-manifest.json)
               echo "Built AMI ID: $AMI_ID"
 
-              echo "##vso[task.setvariable variable=AMI_ID;isOutput=true]$AMI_ID"
-            name: packerBuild
-            displayName: 'Packer Build AMI'
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-
-          # Save AMI ID as artifact to use in Stage 2
-          - script: |
-              mkdir -p $(Build.ArtifactStagingDirectory)/packer
-              echo "$(packerBuild.AMI_ID)" > $(Build.ArtifactStagingDirectory)/packer/ami-id.txt
-              echo "AMI ID saved: $(packerBuild.AMI_ID)"
-            displayName: 'Save AMI ID'
-
-          - publish: $(Build.ArtifactStagingDirectory)/packer
-            artifact: packer-output
-            displayName: 'Publish AMI ID Artifact'
-
-
-# STAGE 2:- Deploying Infrastructure in AWS with terraform
-
-  - stage: TerraformDeploy
-    displayName: 'Stage 2 - Deploy AWS Infrastructure'
-    dependsOn: PackerBuild # After first stage this should run
-    jobs:
-      - job: Deploy
-        displayName: 'Terraform Apply'
-        # pool:
-        #   vmImage: 'ubuntu-latest'
-        pool:
-          name: 'aws-ec2-pool'
-        variables:
-          AMI_ID: $[ stageDependencies.PackerBuild.BuildAMI.outputs['packerBuild.AMI_ID'] ]
-        steps:
-
-          # Checkout code
-          - checkout: self
-            displayName: 'Checkout Code'
-
-          # Download AMI ID from Stage 1
-          - download: current
-            artifact: packer-output
-            displayName: 'Download AMI ID from Stage 1'
-
-          # Read AMI ID
-          
-          - script: |
-              AMI_ID=$(cat $(Pipeline.Workspace)/packer-output/ami-id.txt)
-              echo "Using AMI ID: $AMI_ID"
-              echo "##vso[task.setvariable variable=AMI_ID]$AMI_ID"
-            displayName: 'Read AMI ID'
-
-          # Install Terraform
-          - script: |
-              curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
-              echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-              sudo apt-get update && sudo apt-get install -y terraform
-              terraform version
-            displayName: 'Install Terraform'
-
-          #Terraform Init
-          - script: |
-              cd terraform
-              terraform init
-            displayName: 'Terraform Init'
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-
-          # Terraform Plan
-          - script: |
-              cd terraform
-
-              echo "=== Terraform Plan ==="
-              terraform plan \
-                -var="ami_id=$(AMI_ID)" \
-                -var="subnet_id=$(SUBNET_ID)" \
-                -var="vpc_id=$(VPC_ID)" \
-                -out=tfplan
-
-              echo "=== Terraform Apply ==="
-              terraform apply -auto-approve tfplan
-
-              echo "=== Wait for state ==="
-              sleep 20
-
-              echo "=== Terraform State List ==="
-              terraform state list
-
-              echo "=== Terraform Outputs ==="
-              terraform output
-
-              echo "=== Capture IP ==="
-              VM_IP=$(terraform output -raw instance_public_ip 2>/dev/null)
-
-              # Fallback: Get IP directly from AWS if terraform output fails
-              if [ -z "$VM_IP" ]; then
-                echo "Terraform output empty, fetching from AWS directly..."
-                INSTANCE_ID=$(terraform output -raw instance_id 2>/dev/null)
-                if [ -z "$INSTANCE_ID" ]; then
-                  echo "Getting instance ID from AWS..."
-                  INSTANCE_ID=$(aws ec2 describe-instances \
-                    --filters "Name=tag:Name,Values=custom-image-instance" \
-                              "Name=instance-state-name,Values=running" \
-                    --query "Reservations.Instances.InstanceId" \
-                    --output text)
-                fi
-                VM_IP=$(aws ec2 describe-instances \
-                  --instance-ids $INSTANCE_ID \
-                  --query "Reservations.Instances.PublicIpAddress" \
-                  --output text)
+              if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "null" ]; then
+                echo "Failed to extract AMI ID!"
+                # Fallback: try from log
+                AMI_ID=$(grep 'artifact,0,id' packer-output.log | tail -1 | cut -d: -f2)
+                echo "Fallback AMI ID: $AMI_ID"
               fi
-              echo "EC2 Public IP: $VM_IP"
-              echo "##vso[task.setvariable variable=VM_IP;isOutput=true]$VM_IP"
-            name: terraformApply
-            displayName: 'Terraform Plan + Apply'
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
 
+              # Save AMI ID for next steps
+              echo "##vso[task.setvariable variable=AMI_ID;isOutput=true]$AMI_ID"
 
+              # Create artifact directory
+              mkdir -p $(Build.ArtifactStagingDirectory)/ami-artifact
 
+              # Create artifact files
+              echo "$AMI_ID" > $(Build.ArtifactStagingDirectory)/ami-artifact/ami-id.txt
+              echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > $(Build.ArtifactStagingDirectory)/ami-artifact/build-timestamp.txt
+              echo "$(Build.BuildId)" > $(Build.ArtifactStagingDirectory)/ami-artifact/build-id.txt
 
+              # Create metadata JSON
+              cat > $(Build.ArtifactStagingDirectory)/ami-artifact/metadata.json << METAEOF
+              {
+                "ami_id": "$AMI_ID",
+                "build_id": "$(Build.BuildId)",
+                "build_number": "$(Build.BuildNumber)",
+                "source_branch": "$(Build.SourceBranchName)",
+                "commit_sha": "$(Build.SourceVersion)",
+                "build_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                "builder": "packer",
+                "region": "$(AWS_DEFAULT_REGION)"
+              }
+              METAEOF
 
+              echo "=== Artifact Contents ==="
+              ls -la $(Build.ArtifactStagingDirectory)/ami-artifact/
+              cat $(Build.ArtifactStagingDirectory)/ami-artifact/metadata.json
+            name: packerBuild
+            displayName: 'Build AMI with Packer'
 
-
-          # - script: |
-          #     cd terraform
-          #     terraform plan \
-          #       -var="ami_id=$(AMI_ID)" \
-          #       -var="key_name=$(KEY_NAME)" \
-          #       -var="subnet_id=$(SUBNET_ID)" \
-          #       -var="vpc_id=$(VPC_ID)" \
-          #       -out=tfplan
-          #   displayName: 'Terraform Plan'
-          #   env:
-          #     AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-          #     AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-          #     AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-
-          # # Terraform Apply
-          # - script: |
-          #     cd terraform
-          #     terraform apply -auto-approve tfplan
-
-          #     sleep 5
-
-          #     echo "=== All Terraform Outputs ==="
-          #     terraform output
-
-          #     VM_IP=$(terraform output -raw instance_public_ip 2>/dev/null)
-
-          #     if [ -z "$VM_IP" ]; then
-          #       echo "IP empty, refreshing state..."
-          #       terraform refresh \
-          #         -var="ami_id=$(AMI_ID)" \
-          #         -var="subnet_id=$(SUBNET_ID)" \
-          #         -var="vpc_id=$(VPC_ID)"
-          #       VM_IP=$(terraform output -raw instance_public_ip)
-          #     fi
-
-          #     echo "EC2 Public IP: $VM_IP"
-
-          #     # # Capture outputs for Ansible stage
-          #     # VM_IP=$(terraform output -raw instance_public_ip)
-              
-          #     echo "##vso[task.setvariable variable=VM_IP;isOutput=true]$VM_IP"
-          #   name: terraformApply
-          #   displayName: 'Terraform Apply'
-          #   env:
-          #     AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-          #     AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-          #     AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-
-          # Save VM IP for Ansible stage
-          # - script: |
-          #     mkdir -p $(Build.ArtifactStagingDirectory)/terraform
-          #     echo "$(terraformApply.VM_IP)" > $(Build.ArtifactStagingDirectory)/terraform/vm-ip.txt
-          #   displayName: 'Save VM IP'
-
-          # - publish: $(Build.ArtifactStagingDirectory)/terraform
-          #   artifact: terraform-output
-          #   displayName: 'Publish VM IP Artifact'
-
-
-# STAGE 3:- Configuring the EC2 Instance with Ansible
-
-  - stage: AnsibleConfigure
-    displayName: 'Stage 3 - Configure EC2 with Ansible'
-    dependsOn: TerraformDeploy
-    jobs:
-      - job: Configure
-        displayName: 'Run Ansible Playbooks'
-        # pool:
-        #   vmImage: 'ubuntu-latest'
-        pool:
-          name: 'aws-ec2-pool'
-        variables:
-          VM_IP: $[ stageDependencies.TerraformDeploy.Deploy.outputs['terraformApply.VM_IP'] ]
-        steps:
-
-          # Checkout code
-          - checkout: self
-            displayName: 'Checkout Code'
-
-          # Download VM IP from Stage 2
-          # - download: current
-          #   artifact: terraform-output
-          #   displayName: 'Download VM IP from Stage 2'
-
-          # Read VM IP
-          - script: |
-              VM_IP=$(aws ec2 describe-instances \
-                --filters "Name=tag:Name,Values=instance-from-custom-image" \
-                --query "Reservations[].Instances[].PublicIpAddress" \
-                --output text)
-
-              echo "EC2 Public IP: $VM_IP"
-              echo "##vso[task.setvariable variable=VM_IP]$VM_IP"
-            displayName: 'Get VM IP from AWS'
-            env:
-              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
-              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
-              AWS_DEFAULT_REGION: $(AWS_DEFAULT_REGION)
-
-          # - script: |
-          #     VM_IP=$(cat $(Pipeline.Workspace)/terraform-output/vm-ip.txt)
-          #     echo "Target EC2 IP: $VM_IP"
-          #     echo "##vso[task.setvariable variable=VM_IP]$VM_IP"
-          #   displayName: 'Read VM IP'
-
-          # Install Ansible
-          - script: |
-              sudo apt-get update
-              sudo apt-get install -y ansible
-              ansible --version
-            displayName: 'Install Ansible'
-
-          # Setup SSH key for Ansible to connect to EC2
+          # ---- Download GPG Private Key ----
           - task: DownloadSecureFile@1
-            name: sshKey
-            displayName: 'Download SSH Key'
+            name: gpgPrivateKey
             inputs:
-              secureFile: 'test-key.pem'
+              secureFile: 'gpg-private.key'
+            displayName: 'Download GPG Private Key'
 
+          # ---- Sign & Encrypt the Artifact ----
           - script: |
-              mkdir -p ~/.ssh
-              cp $(sshKey.secureFilePath) ~/.ssh/ec2-key.pem
-              chmod 600 ~/.ssh/ec2-key.pem
+              echo "=== Importing GPG Private Key ==="
+              gpg --batch --import $(gpgPrivateKey.secureFilePath)
+              gpg --list-secret-keys
 
-              # Add EC2 to known hosts
-              sleep 30
-              ssh-keyscan -H $(VM_IP) >> ~/.ssh/known_hosts 2>/dev/null
-              echo "SSH key ready"
-            displayName: 'Setup SSH Key'
+              ARTIFACT_DIR=$(Build.ArtifactStagingDirectory)/ami-artifact
+              cd $ARTIFACT_DIR
 
-          # Create dynamic inventory file
+              echo "=== Creating SHA256 Checksum ==="
+              sha256sum ami-id.txt metadata.json build-timestamp.txt build-id.txt > checksum.sha256
+              cat checksum.sha256
+
+              echo "=== Signing Checksum with GPG ==="
+              gpg --batch --yes --armor \
+                --local-user "pipeline@devops.local" \
+                --detach-sign checksum.sha256
+
+              echo "=== Encrypting AMI ID ==="
+              gpg --batch --yes --armor \
+                --local-user "pipeline@devops.local" \
+                --sign --encrypt \
+                --recipient "pipeline@devops.local" \
+                ami-id.txt
+
+              # Remove unencrypted ami-id.txt (keep only encrypted version)
+              rm -f ami-id.txt
+
+              echo "=== Final Signed Artifact ==="
+              ls -la $ARTIFACT_DIR
+              echo ""
+              echo "Files:"
+              echo "  ami-id.txt.asc       → Signed + Encrypted AMI ID"
+              echo "  checksum.sha256      → SHA256 checksums"
+              echo "  checksum.sha256.asc  → GPG detached signature"
+              echo "  metadata.json        → Build metadata"
+              echo "  build-timestamp.txt  → Build timestamp"
+              echo "  build-id.txt         → Pipeline build ID"
+              echo ""
+              echo "✅ Artifact signed and encrypted!"
+            displayName: 'Sign & Encrypt Artifact'
+
+          # ---- Publish Signed Artifact ----
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/ami-artifact'
+              ArtifactName: 'signed-ami-artifact'
+              publishLocation: 'Container'
+            displayName: 'Publish Signed Artifact'
+
+  
+  # Stage 3: Verify Artifact (proves signing works)
+  - stage: VerifyArtifact
+    displayName: 'Stage 3 - Verify Signed Artifact'
+    dependsOn: BuildAndSign
+    condition: succeeded()
+    jobs:
+      - job: VerifySignature
+        displayName: 'Verify GPG Signature & Decrypt'
+        steps:
+          # ---- Download the Signed Artifact ----
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'signed-ami-artifact'
+              downloadPath: '$(System.ArtifactsDirectory)'
+            displayName: 'Download Signed Artifact'
+
+          # ---- Download GPG Public Key (ONLY public, not private!) ----
+          - task: DownloadSecureFile@1
+            name: gpgPublicKey
+            inputs:
+              secureFile: 'gpg-public.key'
+            displayName: 'Download GPG Public Key'
+
+          # ---- Verify & Decrypt ----
           - script: |
-              cat > ansible/inventory.ini << EOF
-              [instance-from-custom-image]
-              $(VM_IP) ansible_user=ec2-user ansible_ssh_private_key_file=~/.ssh/ec2-key.pem
-              EOF
+              echo "=== Importing GPG Public Key (ONLY public!) ==="
+              gpg --batch --import $(gpgPublicKey.secureFilePath)
+              gpg --list-keys
 
-              echo "=== Inventory File ==="
-              cat ansible/inventory.ini
-            displayName: 'Create Ansible Inventory'
+              ARTIFACT_DIR=$(System.ArtifactsDirectory)/signed-ami-artifact
+              cd $ARTIFACT_DIR
 
-          # Test SSH connection
-          - script: |
-              ansible -i ansible/inventory.ini devops_servers -m ping
-            displayName: 'Test Ansible Connection'
+              echo ""
+              echo "=== Step 1: Verify Checksum Signature ==="
+              gpg --batch --verify checksum.sha256.asc checksum.sha256
+              if [ $? -eq 0 ]; then
+                echo "Signature is VALID — artifact is authentic!"
+              else
+                echo "Signature is INVALID — artifact may be tampered!"
+                exit 1
+              fi
 
-          # Run Playbook — Check Software Versions
-          - script: |
-              cd ansible
-              ansible-playbook -i inventory.ini playbooks/add-versions.yml -v
-            displayName: 'Run add-versions Playbook'
+              echo ""
+              echo "=== Step 2: Verify File Checksums ==="
+              sha256sum -c checksum.sha256 --ignore-missing
+              if [ $? -eq 0 ]; then
+                echo "Checksums match — no tampering detected!"
+              else
+                echo "Checksums DON'T match — files were modified!"
+                exit 1
+              fi
 
-          # Run Playbook — Mount Volume
-          - script: |
-              cd ansible
-              ansible-playbook -i inventory.ini playbooks/mount-volume.yml -v
-            displayName: 'Run mount-volume Playbook'
+              echo ""
+              echo "=== Step 3: Decrypt AMI ID ==="
+              # Need private key to decrypt (import it)
+              gpg --batch --import $(gpgPrivateKey.secureFilePath) 2>/dev/null || true
+              gpg --batch --yes --decrypt ami-id.txt.asc > ami-id-decrypted.txt
+              AMI_ID=$(cat ami-id-decrypted.txt)
+              echo "Decrypted AMI ID: $AMI_ID"
 
-          #Final Verification
-          - script: |
+              echo ""
+              echo "=== Step 4: Display Build Metadata ==="
+              cat metadata.json
+
+              echo ""
               echo "============================================"
-              echo "  DEPLOYMENT VERIFICATION"
+              echo "  ALL VERIFICATION PASSED!"
               echo "============================================"
-              ssh -i ~/.ssh/ec2-key.pem -o StrictHostKeyChecking=no ec2-user@$(VM_IP) << 'VERIFY'
-              echo ""
-              echo "=== Software Versions ==="
-              java -version 2>&1 | head -1
-              jenkins --version 2>&1
-              python3.14 --version 2>&1
-              subl --version 2>&1
-              google-chrome --version 2>&1
-              echo ""
-              echo "=== Mounted Volumes ==="
-              df -h | grep /mnt/data
-              echo ""
-              echo "=== Version Report ==="
-              cat /opt/version-report/versions.txt 2>/dev/null
-              echo ""
-              echo "ALL CHECKS COMPLETE"
-              VERIFY
-            displayName: 'Final Verification'
+              echo "  Signature:  Valid"
+              echo "  Checksums:  Match"
+              echo "  AMI ID:     $AMI_ID"
+              echo "  Ready for downstream Pipeline 2!"
+              echo "============================================"
+            displayName: 'Verify Signature & Decrypt AMI ID'
+
+          # ---- Also download private key for decryption ----
+          - task: DownloadSecureFile@1
+            name: gpgPrivateKey
+            inputs:
+              secureFile: 'gpg-private.key'
+            displayName: 'Download GPG Private Key (for decrypt)'
 

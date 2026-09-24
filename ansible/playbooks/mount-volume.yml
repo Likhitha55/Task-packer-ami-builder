@@ -1,6 +1,0 @@
----
-- hosts: instance-from-custom-image
-  become: true
-  roles:
-    - mount-volume
-    
