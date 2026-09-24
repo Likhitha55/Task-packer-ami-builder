@@ -189,7 +189,7 @@ stages:
               echo "  build-timestamp.txt  → Build timestamp"
               echo "  build-id.txt         → Pipeline build ID"
               echo ""
-              echo "✅ Artifact signed and encrypted!"
+              echo "Artifact signed and encrypted!"
             displayName: 'Sign & Encrypt Artifact'
 
           # ---- Publish Signed Artifact ----
@@ -228,6 +228,9 @@ stages:
 
           # ---- Verify & Decrypt ----
           - script: |
+
+              export GNUPGHOME=$(mktemp -d)
+
               echo "=== Importing GPG Public Key (ONLY public!) ==="
               gpg --batch --import $(gpgPublicKey.secureFilePath)
               gpg --list-keys
@@ -236,8 +239,12 @@ stages:
               cd $ARTIFACT_DIR
 
               echo ""
+              echo "=== Files in Artifact ==="
+              ls -la
+
+              echo ""
               echo "=== Step 1: Verify Checksum Signature ==="
-              gpg --batch --verify checksum.sha256.asc checksum.sha256
+              gpg --batch --homedir $GNUPGHOME --verify checksum.sha256.asc checksum.sha256
               if [ $? -eq 0 ]; then
                 echo "Signature is VALID — artifact is authentic!"
               else
@@ -257,9 +264,11 @@ stages:
 
               echo ""
               echo "=== Step 3: Decrypt AMI ID ==="
-              # Need private key to decrypt (import it)
-              gpg --batch --import $(gpgPrivateKey.secureFilePath) 2>/dev/null || true
-              gpg --batch --yes --decrypt ami-id.txt.asc > ami-id-decrypted.txt
+              gpg --batch --yes \
+                --homedir $GNUPGHOME \
+                --pinentry-mode loopback \
+                --trust-model always \
+                --decrypt ami-id.txt.asc > ami-id-decrypted.txt
               AMI_ID=$(cat ami-id-decrypted.txt)
               echo "Decrypted AMI ID: $AMI_ID"
 
