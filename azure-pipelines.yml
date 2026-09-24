@@ -82,48 +82,46 @@ stages:
     condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
       - job: BuildAMI
-        displayName: 'Packer Build → Sign → Encrypt'
+        displayName: 'Packer Build → Sign Artifact'
         timeoutInMinutes: 30
         steps:
           - checkout: self
             displayName: 'Checkout Code'
 
-          # ---- Build AMI with Packer ----
           - script: |
+              set -e
               export AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY_ID)
               export AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY)
               export AWS_DEFAULT_REGION=$(AWS_DEFAULT_REGION)
 
               echo "=== Packer Init ==="
               cd packer/
-              packer init .
+              packer init.
 
               echo "=== Packer Build ==="
-              packer build -machine-readable . | tee packer-output.log
+              packer build -machine-readable. | tee packer-output.log
 
-              # Extract AMI ID from manifest
-              AMI_ID=$(jq -r '.builds[-1].artifact_id | split(":")[1]' packer-manifest.json)
+              AMI_ID=$(jq -r '.builds[-1].artifact_id | split(":")' packer-manifest.json)
               echo "Built AMI ID: $AMI_ID"
 
               if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "null" ]; then
-                echo "Failed to extract AMI ID!"
-                # Fallback: try from log
+                echo "Failed to extract AMI ID from manifest!"
                 AMI_ID=$(grep 'artifact,0,id' packer-output.log | tail -1 | cut -d: -f2)
                 echo "Fallback AMI ID: $AMI_ID"
               fi
 
-              # Save AMI ID for next steps
+              if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "null" ]; then
+                echo "Could not extract AMI ID!"
+                exit 1
+              fi
+
               echo "##vso[task.setvariable variable=AMI_ID;isOutput=true]$AMI_ID"
 
-              # Create artifact directory
               mkdir -p $(Build.ArtifactStagingDirectory)/ami-artifact
-
-              # Create artifact files
               echo "$AMI_ID" > $(Build.ArtifactStagingDirectory)/ami-artifact/ami-id.txt
               echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > $(Build.ArtifactStagingDirectory)/ami-artifact/build-timestamp.txt
               echo "$(Build.BuildId)" > $(Build.ArtifactStagingDirectory)/ami-artifact/build-id.txt
 
-              # Create metadata JSON
               cat > $(Build.ArtifactStagingDirectory)/ami-artifact/metadata.json << METAEOF
               {
                 "ami_id": "$AMI_ID",
@@ -139,60 +137,56 @@ stages:
 
               echo "=== Artifact Contents ==="
               ls -la $(Build.ArtifactStagingDirectory)/ami-artifact/
-              cat $(Build.ArtifactStagingDirectory)/ami-artifact/metadata.json
             name: packerBuild
             displayName: 'Build AMI with Packer'
 
-          # ---- Download GPG Private Key ----
           - task: DownloadSecureFile@1
             name: gpgPrivateKey
             inputs:
               secureFile: 'gpg-private.key'
             displayName: 'Download GPG Private Key'
 
-          # ---- Sign & Encrypt the Artifact ----
           - script: |
+              set -e
+
+              export GNUPGHOME=$(mktemp -d)
+
               echo "=== Importing GPG Private Key ==="
-              gpg --batch --import $(gpgPrivateKey.secureFilePath)
-              gpg --list-secret-keys
+              gpg --batch --homedir $GNUPGHOME --import $(gpgPrivateKey.secureFilePath)
+              gpg --batch --homedir $GNUPGHOME --list-secret-keys
 
               ARTIFACT_DIR=$(Build.ArtifactStagingDirectory)/ami-artifact
               cd $ARTIFACT_DIR
 
-              echo "=== Creating SHA256 Checksum ==="
+              echo "=== Creating SHA256 Checksums ==="
               sha256sum ami-id.txt metadata.json build-timestamp.txt build-id.txt > checksum.sha256
               cat checksum.sha256
 
-              echo "=== Signing Checksum with GPG ==="
+              echo "=== Signing Checksum File ==="
               gpg --batch --yes --armor \
+                --homedir $GNUPGHOME \
+                --pinentry-mode loopback \
                 --local-user "pipeline@devops.local" \
                 --detach-sign checksum.sha256
 
-              echo "=== Encrypting AMI ID ==="
+              echo "=== Signing AMI ID File ==="
               gpg --batch --yes --armor \
+                --homedir $GNUPGHOME \
+                --pinentry-mode loopback \
                 --local-user "pipeline@devops.local" \
-                --sign --encrypt \
-                --recipient "pipeline@devops.local" \
-                ami-id.txt
+                --detach-sign ami-id.txt
 
-              # Remove unencrypted ami-id.txt (keep only encrypted version)
-              rm -f ami-id.txt
+              echo "=== Verifying Signed Files Exist ==="
+              test -f checksum.sha256.asc || { echo "Checksum signature missing!"; exit 1; }
+              test -f ami-id.txt.asc || { echo "AMI ID signature missing!"; exit 1; }
 
-              echo "=== Final Signed Artifact ==="
+              echo "=== Final Artifact Contents ==="
               ls -la $ARTIFACT_DIR
-              echo ""
-              echo "Files:"
-              echo "  ami-id.txt.asc       → Signed + Encrypted AMI ID"
-              echo "  checksum.sha256      → SHA256 checksums"
-              echo "  checksum.sha256.asc  → GPG detached signature"
-              echo "  metadata.json        → Build metadata"
-              echo "  build-timestamp.txt  → Build timestamp"
-              echo "  build-id.txt         → Pipeline build ID"
-              echo ""
-              echo "Artifact signed and encrypted!"
-            displayName: 'Sign & Encrypt Artifact'
 
-          # ---- Publish Signed Artifact ----
+              rm -rf $GNUPGHOME
+              echo "Artifact signed successfully!"
+            displayName: 'Sign Artifact with GPG'
+
           - task: PublishBuildArtifacts@1
             inputs:
               PathtoPublish: '$(Build.ArtifactStagingDirectory)/ami-artifact'
@@ -201,16 +195,15 @@ stages:
             displayName: 'Publish Signed Artifact'
 
   
-  # Stage 3: Verify Artifact (proves signing works)
+  # Stage 3: Verify Artifact 
   - stage: VerifyArtifact
     displayName: 'Stage 3 - Verify Signed Artifact'
     dependsOn: BuildAndSign
     condition: succeeded()
     jobs:
       - job: VerifySignature
-        displayName: 'Verify GPG Signature & Decrypt'
+        displayName: 'Verify GPG Signatures'
         steps:
-          # ---- Download the Signed Artifact ----
           - task: DownloadBuildArtifacts@1
             inputs:
               buildType: 'current'
@@ -219,78 +212,61 @@ stages:
               downloadPath: '$(System.ArtifactsDirectory)'
             displayName: 'Download Signed Artifact'
 
-          # ---- Download GPG Public Key (ONLY public, not private!) ----
           - task: DownloadSecureFile@1
             name: gpgPublicKey
             inputs:
               secureFile: 'gpg-public.key'
             displayName: 'Download GPG Public Key'
 
-          # ---- Verify & Decrypt ----
           - script: |
+              set -e
 
               export GNUPGHOME=$(mktemp -d)
 
-              echo "=== Importing GPG Public Key (ONLY public!) ==="
-              gpg --batch --import $(gpgPublicKey.secureFilePath)
-              gpg --list-keys
+              echo "=== Importing GPG Public Key ==="
+              gpg --batch --homedir $GNUPGHOME --import $(gpgPublicKey.secureFilePath)
+              gpg --batch --homedir $GNUPGHOME --list-keys
 
               ARTIFACT_DIR=$(System.ArtifactsDirectory)/signed-ami-artifact
               cd $ARTIFACT_DIR
 
-              echo ""
               echo "=== Files in Artifact ==="
               ls -la
 
               echo ""
               echo "=== Step 1: Verify Checksum Signature ==="
               gpg --batch --homedir $GNUPGHOME --verify checksum.sha256.asc checksum.sha256
-              if [ $? -eq 0 ]; then
-                echo "Signature is VALID — artifact is authentic!"
-              else
-                echo "Signature is INVALID — artifact may be tampered!"
-                exit 1
-              fi
+              echo "Checksum signature is VALID!"
 
               echo ""
-              echo "=== Step 2: Verify File Checksums ==="
+              echo "=== Step 2: Verify AMI ID Signature ==="
+              gpg --batch --homedir $GNUPGHOME --verify ami-id.txt.asc ami-id.txt
+              echo "AMI ID signature is VALID!"
+
+              echo ""
+              echo "=== Step 3: Verify File Checksums ==="
               sha256sum -c checksum.sha256 --ignore-missing
-              if [ $? -eq 0 ]; then
-                echo "Checksums match — no tampering detected!"
-              else
-                echo "Checksums DON'T match — files were modified!"
-                exit 1
-              fi
+              echo "All checksums match!"
 
               echo ""
-              echo "=== Step 3: Decrypt AMI ID ==="
-              gpg --batch --yes \
-                --homedir $GNUPGHOME \
-                --pinentry-mode loopback \
-                --trust-model always \
-                --decrypt ami-id.txt.asc > ami-id-decrypted.txt
-              AMI_ID=$(cat ami-id-decrypted.txt)
-              echo "Decrypted AMI ID: $AMI_ID"
+              echo "=== Step 4: Read Verified AMI ID ==="
+              AMI_ID=$(cat ami-id.txt)
+              echo "Verified AMI ID: $AMI_ID"
 
               echo ""
-              echo "=== Step 4: Display Build Metadata ==="
+              echo "=== Step 5: Build Metadata ==="
               cat metadata.json
 
               echo ""
               echo "============================================"
-              echo "  ALL VERIFICATION PASSED!"
+              echo "   ALL VERIFICATION PASSED!"
               echo "============================================"
-              echo "  Signature:  Valid"
-              echo "  Checksums:  Match"
-              echo "  AMI ID:     $AMI_ID"
-              echo "  Ready for downstream Pipeline 2!"
+              echo "  Checksum Signature:  Valid"
+              echo "  AMI ID Signature:    Valid"
+              echo "  File Checksums:      Match"
+              echo "  AMI ID:              $AMI_ID"
+              echo "  Ready for Pipeline 2 (Classic Release)!"
               echo "============================================"
-            displayName: 'Verify Signature & Decrypt AMI ID'
 
-          # ---- Also download private key for decryption ----
-          - task: DownloadSecureFile@1
-            name: gpgPrivateKey
-            inputs:
-              secureFile: 'gpg-private.key'
-            displayName: 'Download GPG Private Key (for decrypt)'
-
+              rm -rf $GNUPGHOME
+            displayName: 'Verify Signatures & Read AMI ID'
